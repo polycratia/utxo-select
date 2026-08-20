@@ -5,8 +5,8 @@ explain why a selection failed.
 
 ## Status
 
-Pre-alpha. The models are in place; the selection algorithms are not implemented
-yet.
+Pre-alpha. The models and size estimation are in place; the selection
+algorithms are not implemented yet.
 
 ## Installation
 
@@ -41,6 +41,25 @@ request = SelectionRequest(
 )
 
 print(request.total_target_value)
+```
+
+### Size and fee estimation
+
+Virtual size follows from how many inputs and outputs a transaction has and
+what script type each one is. Estimates are upper bounds, and both the virtual
+size and the fee are rounded up: underpaying is what leaves a transaction stuck
+in the mempool.
+
+```python
+from utxo_select import ScriptType, estimate_fee, estimate_vsize
+
+vsize = estimate_vsize(
+    inputs=[ScriptType.P2WPKH, ScriptType.P2WPKH],
+    outputs=[ScriptType.P2TR, ScriptType.P2WPKH],
+)
+
+print(vsize, estimate_fee(vsize, fee_rate=12_000))
+print(ScriptType.P2PKH.input_vsize)  # marginal cost of one more legacy input
 ```
 
 ## Development
