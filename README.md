@@ -5,8 +5,8 @@ explain why a selection failed.
 
 ## Status
 
-Pre-alpha. The models and size estimation are in place; the selection
-algorithms are not implemented yet.
+Pre-alpha. The models, size estimation and the largest-first strategy are in
+place; the smarter strategies are not implemented yet.
 
 ## Installation
 
@@ -42,6 +42,31 @@ request = SelectionRequest(
 
 print(request.total_target_value)
 ```
+
+### Selecting inputs
+
+Largest-first is the baseline strategy: candidates are taken by descending
+value until the targets and the fee they imply are covered. A selection either
+comes back balanced — inputs equal targets plus change plus fee — or it comes
+back as a failure that says what was missing. It never underpays quietly.
+
+```python
+from utxo_select import Selection, select_largest_first
+
+result = select_largest_first(utxos, request)
+
+if isinstance(result, Selection):
+    print([utxo.outpoint for utxo in result.inputs])
+    print(result.fee, result.change, result.vsize)
+else:
+    print(result)  # e.g. insufficient_funds: ... short by ...
+    print(result.reason, result.shortfall)
+```
+
+A remainder too small to be worth an output is given to the fee instead, unless
+the change policy forbids that: `REQUIRE_CHANGE` keeps adding inputs until the
+change clears the dust threshold, and `FORBID_CHANGE` never creates a change
+output at all.
 
 ### Size and fee estimation
 

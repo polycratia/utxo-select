@@ -8,6 +8,12 @@ from utxo_select.models import (
     Target,
     Utxo,
 )
+from utxo_select.selection import (
+    FailureReason,
+    Selection,
+    SelectionFailure,
+    select_largest_first,
+)
 from utxo_select.sizes import (
     WITNESS_SCALE_FACTOR,
     ScriptType,
@@ -21,7 +27,10 @@ __all__ = [
     "DEFAULT_OUTPUT_SCRIPT_SIZE",
     "WITNESS_SCALE_FACTOR",
     "ChangePolicy",
+    "FailureReason",
     "ScriptType",
+    "Selection",
+    "SelectionFailure",
     "SelectionRequest",
     "Target",
     "Utxo",
@@ -29,6 +38,7 @@ __all__ = [
     "estimate_fee",
     "estimate_vsize",
     "estimate_weight",
+    "select_largest_first",
 ]
 
 __version__ = "0.1.0"
