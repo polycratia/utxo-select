@@ -5,8 +5,8 @@ explain why a selection failed.
 
 ## Status
 
-Pre-alpha. The models, size estimation and the largest-first strategy are in
-place; the smarter strategies are not implemented yet.
+Pre-alpha. The models, size estimation, largest-first and branch-and-bound are
+in place; the remaining strategies are not implemented yet.
 
 ## Installation
 
@@ -67,6 +67,29 @@ A remainder too small to be worth an output is given to the fee instead, unless
 the change policy forbids that: `REQUIRE_CHANGE` keeps adding inputs until the
 change clears the dust threshold, and `FORBID_CHANGE` never creates a change
 output at all.
+
+### Spending without change
+
+Branch-and-bound searches for a subset of the candidates that pays the targets
+and the fee exactly, leaving nothing to return. Dropping the change output
+saves its fee now and the fee of spending it later, so a solution is accepted
+while it overshoots by less than those two together. Candidates are weighed by
+effective value, which is what an output is worth after the fee for spending
+it, and an output that costs more to spend than it holds is left alone.
+
+```python
+from utxo_select import select_branch_and_bound
+
+result = select_branch_and_bound(utxos, request)
+
+if isinstance(result, Selection) and not result.has_change:
+    print("changeless", result.fee, result.vsize)
+```
+
+Exact matches are the exception, not the rule. When the search budget runs out
+without one — it defaults to 100000 nodes and is tunable with `max_tries` —
+the largest-first result is returned instead, so the caller always gets the
+best available answer rather than a failure.
 
 ### Size and fee estimation
 

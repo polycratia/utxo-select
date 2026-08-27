@@ -12,6 +12,7 @@ from utxo_select.selection import (
     FailureReason,
     Selection,
     SelectionFailure,
+    select_branch_and_bound,
     select_largest_first,
 )
 from utxo_select.sizes import (
@@ -38,6 +39,7 @@ __all__ = [
     "estimate_fee",
     "estimate_vsize",
     "estimate_weight",
+    "select_branch_and_bound",
     "select_largest_first",
 ]
 
