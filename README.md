@@ -59,7 +59,7 @@ if isinstance(result, Selection):
     print([utxo.outpoint for utxo in result.inputs])
     print(result.fee, result.change, result.vsize)
 else:
-    print(result)  # e.g. insufficient_funds: ... short by ...
+    print(result)  # e.g. insufficient_after_fees: ... short by ...
     print(result.reason, result.shortfall)
 ```
 
@@ -90,6 +90,36 @@ Exact matches are the exception, not the rule. When the search budget runs out
 without one — it defaults to 100000 nodes and is tunable with `max_tries` —
 the largest-first result is returned instead, so the caller always gets the
 best available answer rather than a failure.
+
+### When a selection fails
+
+A failure is a returned value, not an exception, and it names which of four
+things went wrong. They are worth telling apart: two of them are answered by
+funding the wallet, and two by changing the request.
+
+| `reason` | What happened |
+| --- | --- |
+| `insufficient_funds` | the candidates do not hold the targets, fee aside |
+| `insufficient_after_fees` | they hold the targets but not the fee on top |
+| `dust_only` | every candidate costs more to spend than it holds |
+| `change_below_dust` | they can pay, but leave no change worth relaying |
+
+The numbers behind the verdict come with it: `available` against `required`
+and the `shortfall` between them, the `fee` a transaction spending every
+candidate would owe, the `target_value` asked for, and how many candidates
+were worth spending at all.
+
+```python
+from utxo_select import FailureReason, SelectionFailure
+
+result = select_largest_first(utxos, request)
+
+if isinstance(result, SelectionFailure):
+    print(result.available, result.required, result.shortfall, result.fee)
+    print(result.spendable_count, "of", result.candidate_count, "spendable")
+    if result.reason is FailureReason.INSUFFICIENT_AFTER_FEES:
+        print("a lower fee rate closes a gap of", result.shortfall)
+```
 
 ### Size and fee estimation
 

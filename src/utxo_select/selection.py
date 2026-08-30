@@ -19,9 +19,12 @@ overhead, plus 41 virtual bytes and the unlocking script for every input, plus
 as virtual bytes, so a hint for a witness script should already be discounted.
 
 A selection either covers the targets and the fee in full, or it comes back as
-a :class:`SelectionFailure` saying what was missing. The identity inputs ==
-targets + change + fee is checked before a :class:`Selection` can exist, so an
-underpaying result cannot be constructed by accident.
+a :class:`SelectionFailure`. The identity inputs == targets + change + fee is
+checked before a :class:`Selection` can exist, so an underpaying result cannot
+be constructed by accident. A failure is a value rather than an exception, and
+it separates the outcomes a caller would answer differently: a wallet that is
+too small for the targets, one that covers the targets but not the fee on top,
+and one holding nothing but outputs that cost more to spend than they hold.
 """
 
 from __future__ import annotations
@@ -64,13 +67,20 @@ _DEFAULT_MAX_TRIES = 100_000
 class FailureReason(Enum):
     """Why no selection could be made.
 
-    INSUFFICIENT_FUNDS means the candidates cannot pay the targets and the fee
-    the resulting transaction would owe. CHANGE_BELOW_DUST means they can, but
-    not while also leaving a change output worth relaying, which only fails a
-    selection under :attr:`~utxo_select.ChangePolicy.REQUIRE_CHANGE`.
+    INSUFFICIENT_FUNDS means the candidates do not hold the targets even
+    before a fee is counted; no fee rate makes that work.
+    INSUFFICIENT_AFTER_FEES means they hold the targets but not the fee the
+    transaction spending them would owe on top, so a lower rate or fewer,
+    larger inputs can still close the gap. DUST_ONLY means every candidate
+    costs at least as much to spend as it holds, so at this rate the wallet
+    cannot pay anything at all. CHANGE_BELOW_DUST means the candidates can
+    pay, but not while also leaving a change output worth relaying, which only
+    fails a selection under :attr:`~utxo_select.ChangePolicy.REQUIRE_CHANGE`.
     """
 
     INSUFFICIENT_FUNDS = "insufficient_funds"
+    INSUFFICIENT_AFTER_FEES = "insufficient_after_fees"
+    DUST_ONLY = "dust_only"
     CHANGE_BELOW_DUST = "change_below_dust"
 
 
@@ -117,25 +127,76 @@ class Selection:
 
 @dataclass(frozen=True, slots=True)
 class SelectionFailure:
-    """Why the candidates could not pay, in the units of the request.
+    """Why the candidates could not pay, with the numbers behind it.
 
-    ``required`` is what the candidates would have had to hold for the failing
-    attempt to succeed, fee included, and for CHANGE_BELOW_DUST also the
-    smallest change output worth creating.
+    ``available`` is what the candidates hold together and ``required`` what
+    they would have had to hold for the attempt to succeed: the targets alone
+    for INSUFFICIENT_FUNDS, the targets and the fee for INSUFFICIENT_AFTER_FEES
+    and DUST_ONLY, and those plus the smallest change output worth creating for
+    CHANGE_BELOW_DUST. ``fee`` is what a transaction spending every candidate
+    would owe, so ``required - fee`` is the part of the gap the fee rate is not
+    responsible for. ``spendable_count`` counts the candidates worth more than
+    the fee of spending them; the rest are dust at this rate.
     """
 
     reason: FailureReason
     available: int
     required: int
+    target_value: int = 0
+    fee: int = 0
+    candidate_count: int = 0
+    spendable_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, FailureReason):
+            raise TypeError(
+                f"reason must be a FailureReason, got "
+                f"{type(self.reason).__name__}"
+            )
+        _check_int(self.available, "available", minimum=0)
+        _check_int(self.required, "required", minimum=0)
+        _check_int(self.target_value, "target_value", minimum=0)
+        _check_int(self.fee, "fee", minimum=0)
+        _check_int(self.candidate_count, "candidate_count", minimum=0)
+        _check_int(self.spendable_count, "spendable_count", minimum=0)
+        if self.spendable_count > self.candidate_count:
+            raise ValueError(
+                f"spendable_count {self.spendable_count} exceeds "
+                f"candidate_count {self.candidate_count}"
+            )
 
     @property
     def shortfall(self) -> int:
         return max(self.required - self.available, 0)
 
+    @property
+    def dust_count(self) -> int:
+        """Candidates that cost at least as much to spend as they hold."""
+        return self.candidate_count - self.spendable_count
+
     def __str__(self) -> str:
+        if self.reason is FailureReason.INSUFFICIENT_FUNDS:
+            return (
+                f"{self.reason.value}: {self.available} available against "
+                f"{self.target_value} in targets, short by {self.shortfall} "
+                f"before the {self.fee} fee"
+            )
+        if self.reason is FailureReason.INSUFFICIENT_AFTER_FEES:
+            return (
+                f"{self.reason.value}: {self.available} available covers "
+                f"{self.target_value} in targets but not the {self.fee} fee "
+                f"on top, short by {self.shortfall}"
+            )
+        if self.reason is FailureReason.DUST_ONLY:
+            return (
+                f"{self.reason.value}: all {self.candidate_count} candidates "
+                f"cost more to spend than they hold at this fee rate, "
+                f"{self.available} available of {self.required} required"
+            )
         return (
-            f"{self.reason.value}: {self.available} available, "
-            f"{self.required} required, short by {self.shortfall}"
+            f"{self.reason.value}: {self.available} available pays "
+            f"{self.target_value} and the {self.fee} fee but leaves no change "
+            f"worth relaying, short by {self.shortfall}"
         )
 
 
@@ -153,6 +214,11 @@ def _base_vsize(request: SelectionRequest) -> int:
     )
 
 
+def _effective_value(utxo: Utxo, fee_rate: int) -> int:
+    """What an output is worth once the fee for spending it is taken off."""
+    return utxo.value - estimate_fee(_input_vsize(utxo), fee_rate)
+
+
 def _ordered_candidates(utxos: Iterable[Utxo]) -> tuple[Utxo, ...]:
     candidates = tuple(utxos)
     seen: set[str] = set()
@@ -165,6 +231,59 @@ def _ordered_candidates(utxos: Iterable[Utxo]) -> tuple[Utxo, ...]:
             raise ValueError(f"duplicate candidate outpoint: {utxo.outpoint}")
         seen.add(utxo.outpoint)
     return tuple(sorted(candidates, key=lambda u: (-u.value, u.outpoint)))
+
+
+def _explain_failure(
+    candidates: Sequence[Utxo], request: SelectionRequest
+) -> SelectionFailure:
+    """Say which way the candidates fell short, spending all of them.
+
+    The three shortfalls are told apart by what the candidates hold against
+    the targets alone and against the targets plus the fee; a wallet whose
+    outputs are all dust is reported as such first, because there the fee rate
+    rather than the amount is what makes it unspendable.
+    """
+    target_value = request.total_target_value
+    available = sum(utxo.value for utxo in candidates)
+    vsize = _base_vsize(request) + sum(
+        _input_vsize(utxo) for utxo in candidates
+    )
+    fee = estimate_fee(vsize, request.fee_rate)
+    spendable = sum(
+        1
+        for utxo in candidates
+        if _effective_value(utxo, request.fee_rate) > 0
+    )
+
+    def failure(
+        reason: FailureReason, required: int, attempt_fee: int = fee
+    ) -> SelectionFailure:
+        return SelectionFailure(
+            reason=reason,
+            available=available,
+            required=required,
+            target_value=target_value,
+            fee=attempt_fee,
+            candidate_count=len(candidates),
+            spendable_count=spendable,
+        )
+
+    if candidates and spendable == 0:
+        return failure(FailureReason.DUST_ONLY, target_value + fee)
+    if available < target_value:
+        return failure(FailureReason.INSUFFICIENT_FUNDS, target_value)
+    if available < target_value + fee:
+        return failure(FailureReason.INSUFFICIENT_AFTER_FEES, target_value + fee)
+
+    fee_with_change = estimate_fee(
+        vsize + _output_vsize(request.change_script_size), request.fee_rate
+    )
+    minimum_change = max(request.dust_threshold, 1)
+    return failure(
+        FailureReason.CHANGE_BELOW_DUST,
+        target_value + fee_with_change + minimum_change,
+        fee_with_change,
+    )
 
 
 def select_largest_first(
@@ -183,6 +302,9 @@ def select_largest_first(
     the whole remainder to the fee, however large it is, so it should be used
     with candidates that are close to the target. REQUIRE_CHANGE keeps adding
     inputs until a change output above the threshold is possible.
+
+    When nothing covers the request the result is a :class:`SelectionFailure`
+    naming which shortfall it was, with the amounts it was measured against.
 
     Duplicate outpoints raise :exc:`ValueError`: spending one twice is a caller
     bug, not a selection that failed.
@@ -231,20 +353,7 @@ def select_largest_first(
             vsize=vsize,
         )
 
-    fee = estimate_fee(vsize, request.fee_rate)
-    if total_input - target_value - fee < 0:
-        return SelectionFailure(
-            reason=FailureReason.INSUFFICIENT_FUNDS,
-            available=total_input,
-            required=target_value + fee,
-        )
-
-    fee_with_change = estimate_fee(vsize + change_vsize, request.fee_rate)
-    return SelectionFailure(
-        reason=FailureReason.CHANGE_BELOW_DUST,
-        available=total_input,
-        required=target_value + fee_with_change + minimum_change,
-    )
+    return _explain_failure(candidates, request)
 
 
 def select_branch_and_bound(
@@ -269,7 +378,8 @@ def select_branch_and_bound(
     visiting at most ``max_tries`` nodes and keeping the solution that
     overshoots least. When it finds none - the usual case for a wallet whose
     outputs do not happen to add up - :func:`select_largest_first` answers
-    instead, so the fallback is a normal selection and not a failure.
+    instead, so the fallback is a normal selection, or the same explained
+    failure the baseline would have given.
 
     REQUIRE_CHANGE is delegated to the baseline unchanged: a policy that
     demands a change output has nothing to gain from a changeless search.
@@ -292,9 +402,7 @@ def select_branch_and_bound(
 
     pool: list[tuple[int, Utxo]] = []
     for utxo in candidates:
-        effective = utxo.value - estimate_fee(
-            _input_vsize(utxo), request.fee_rate
-        )
+        effective = _effective_value(utxo, request.fee_rate)
         if effective > 0:
             pool.append((effective, utxo))
     pool.sort(key=lambda item: (-item[0], item[1].outpoint))
