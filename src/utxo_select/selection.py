@@ -12,6 +12,12 @@ that output later, and those two together bound how much overpayment is still
 an improvement. When no such subset turns up within the search budget the
 caller gets the largest-first result instead.
 
+Both strategies take a :class:`~utxo_select.policy.SelectionPolicy`: how
+deeply an output must be confirmed before it may be spent, and whether the
+wallet would rather link few of its outputs in one transaction or use a cheap
+block to sweep many. The policy filters the candidates and decides the order
+they are tried in; neither strategy branches on it.
+
 Sizes here come from the ``script_size`` hints carried by the models rather
 than from :class:`~utxo_select.sizes.ScriptType`: a transaction costs a fixed
 overhead, plus 41 virtual bytes and the unlocking script for every input, plus
@@ -22,9 +28,10 @@ A selection either covers the targets and the fee in full, or it comes back as
 a :class:`SelectionFailure`. The identity inputs == targets + change + fee is
 checked before a :class:`Selection` can exist, so an underpaying result cannot
 be constructed by accident. A failure is a value rather than an exception, and
-it separates the outcomes a caller would answer differently: a wallet that is
-too small for the targets, one that covers the targets but not the fee on top,
-and one holding nothing but outputs that cost more to spend than they hold.
+it separates the outcomes a caller would answer differently: a wallet too small
+for the targets, one that covers the targets but not the fee on top, one
+holding nothing but outputs that cost more to spend than they hold, and one
+that is only waiting for its outputs to confirm.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ from utxo_select.models import (
     Utxo,
     _check_int,
 )
+from utxo_select.policy import DEFAULT_POLICY, SelectionPolicy
 from utxo_select.sizes import estimate_fee
 
 __all__ = [
@@ -76,12 +84,15 @@ class FailureReason(Enum):
     cannot pay anything at all. CHANGE_BELOW_DUST means the candidates can
     pay, but not while also leaving a change output worth relaying, which only
     fails a selection under :attr:`~utxo_select.ChangePolicy.REQUIRE_CHANGE`.
+    INSUFFICIENT_CONFIRMATIONS means the wallet holds enough, but part of it is
+    shallower than the policy allows: waiting answers that one.
     """
 
     INSUFFICIENT_FUNDS = "insufficient_funds"
     INSUFFICIENT_AFTER_FEES = "insufficient_after_fees"
     DUST_ONLY = "dust_only"
     CHANGE_BELOW_DUST = "change_below_dust"
+    INSUFFICIENT_CONFIRMATIONS = "insufficient_confirmations"
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,14 +140,17 @@ class Selection:
 class SelectionFailure:
     """Why the candidates could not pay, with the numbers behind it.
 
-    ``available`` is what the candidates hold together and ``required`` what
-    they would have had to hold for the attempt to succeed: the targets alone
-    for INSUFFICIENT_FUNDS, the targets and the fee for INSUFFICIENT_AFTER_FEES
-    and DUST_ONLY, and those plus the smallest change output worth creating for
-    CHANGE_BELOW_DUST. ``fee`` is what a transaction spending every candidate
-    would owe, so ``required - fee`` is the part of the gap the fee rate is not
-    responsible for. ``spendable_count`` counts the candidates worth more than
-    the fee of spending them; the rest are dust at this rate.
+    ``available`` is what the candidates the policy left in play hold together
+    and ``required`` what they would have had to hold for the attempt to
+    succeed: the targets alone for INSUFFICIENT_FUNDS, the targets and the fee
+    for INSUFFICIENT_AFTER_FEES, DUST_ONLY and INSUFFICIENT_CONFIRMATIONS, and
+    those plus the smallest change output worth creating for CHANGE_BELOW_DUST.
+    ``fee`` is what a transaction spending every candidate in play would owe,
+    so ``required - fee`` is the part of the gap the fee rate is not
+    responsible for. ``eligible_count`` counts the candidates the policy
+    allowed and ``withheld_value`` is what the rest hold, waiting on
+    confirmations. ``spendable_count`` counts the candidates worth more than
+    the fee of spending them, eligible or not; the rest are dust at this rate.
     """
 
     reason: FailureReason
@@ -145,7 +159,9 @@ class SelectionFailure:
     target_value: int = 0
     fee: int = 0
     candidate_count: int = 0
+    eligible_count: int = 0
     spendable_count: int = 0
+    withheld_value: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.reason, FailureReason):
@@ -158,7 +174,14 @@ class SelectionFailure:
         _check_int(self.target_value, "target_value", minimum=0)
         _check_int(self.fee, "fee", minimum=0)
         _check_int(self.candidate_count, "candidate_count", minimum=0)
+        _check_int(self.eligible_count, "eligible_count", minimum=0)
         _check_int(self.spendable_count, "spendable_count", minimum=0)
+        _check_int(self.withheld_value, "withheld_value", minimum=0)
+        if self.eligible_count > self.candidate_count:
+            raise ValueError(
+                f"eligible_count {self.eligible_count} exceeds "
+                f"candidate_count {self.candidate_count}"
+            )
         if self.spendable_count > self.candidate_count:
             raise ValueError(
                 f"spendable_count {self.spendable_count} exceeds "
@@ -173,6 +196,11 @@ class SelectionFailure:
     def dust_count(self) -> int:
         """Candidates that cost at least as much to spend as they hold."""
         return self.candidate_count - self.spendable_count
+
+    @property
+    def withheld_count(self) -> int:
+        """Candidates set aside as not confirmed deeply enough to spend."""
+        return self.candidate_count - self.eligible_count
 
     def __str__(self) -> str:
         if self.reason is FailureReason.INSUFFICIENT_FUNDS:
@@ -192,6 +220,13 @@ class SelectionFailure:
                 f"{self.reason.value}: all {self.candidate_count} candidates "
                 f"cost more to spend than they hold at this fee rate, "
                 f"{self.available} available of {self.required} required"
+            )
+        if self.reason is FailureReason.INSUFFICIENT_CONFIRMATIONS:
+            return (
+                f"{self.reason.value}: {self.available} available from "
+                f"{self.eligible_count} of {self.candidate_count} candidates, "
+                f"short by {self.shortfall}; {self.withheld_value} waits on "
+                f"confirmations"
             )
         return (
             f"{self.reason.value}: {self.available} available pays "
@@ -219,7 +254,7 @@ def _effective_value(utxo: Utxo, fee_rate: int) -> int:
     return utxo.value - estimate_fee(_input_vsize(utxo), fee_rate)
 
 
-def _ordered_candidates(utxos: Iterable[Utxo]) -> tuple[Utxo, ...]:
+def _checked_candidates(utxos: Iterable[Utxo]) -> tuple[Utxo, ...]:
     candidates = tuple(utxos)
     seen: set[str] = set()
     for utxo in candidates:
@@ -230,30 +265,63 @@ def _ordered_candidates(utxos: Iterable[Utxo]) -> tuple[Utxo, ...]:
         if utxo.outpoint in seen:
             raise ValueError(f"duplicate candidate outpoint: {utxo.outpoint}")
         seen.add(utxo.outpoint)
-    return tuple(sorted(candidates, key=lambda u: (-u.value, u.outpoint)))
+    return candidates
+
+
+def _policy_candidates(
+    candidates: Sequence[Utxo],
+    request: SelectionRequest,
+    policy: SelectionPolicy,
+) -> tuple[Utxo, ...]:
+    """The candidates the policy leaves in play, in the order it wants them.
+
+    Ties are broken by outpoint so that equal values do not make the result
+    depend on the order the candidates were passed in. An output that costs at
+    least as much to spend as it holds is dropped whichever way the policy
+    leans: spending it moves a selection further from covering the targets,
+    never closer.
+    """
+    eligible = [
+        utxo
+        for utxo in candidates
+        if policy.accepts(utxo) and _effective_value(utxo, request.fee_rate) > 0
+    ]
+    if policy.consolidates_at(request.fee_rate):
+        return tuple(sorted(eligible, key=lambda u: (u.value, u.outpoint)))
+    return tuple(sorted(eligible, key=lambda u: (-u.value, u.outpoint)))
 
 
 def _explain_failure(
-    candidates: Sequence[Utxo], request: SelectionRequest
+    candidates: Sequence[Utxo],
+    eligible: Sequence[Utxo],
+    request: SelectionRequest,
+    policy: SelectionPolicy,
 ) -> SelectionFailure:
     """Say which way the candidates fell short, spending all of them.
 
-    The three shortfalls are told apart by what the candidates hold against
-    the targets alone and against the targets plus the fee; a wallet whose
+    The shortfalls are told apart by what the eligible candidates hold against
+    the targets alone and against the targets plus the fee. A wallet whose
     outputs are all dust is reported as such first, because there the fee rate
-    rather than the amount is what makes it unspendable.
+    rather than the amount is what makes it unspendable; a wallet that would
+    have paid with the outputs the policy is still waiting on comes next,
+    because time rather than money is what it is short of.
     """
     target_value = request.total_target_value
-    available = sum(utxo.value for utxo in candidates)
-    vsize = _base_vsize(request) + sum(
-        _input_vsize(utxo) for utxo in candidates
-    )
+    available = sum(utxo.value for utxo in eligible)
+    vsize = _base_vsize(request) + sum(_input_vsize(utxo) for utxo in eligible)
     fee = estimate_fee(vsize, request.fee_rate)
     spendable = sum(
         1
         for utxo in candidates
         if _effective_value(utxo, request.fee_rate) > 0
     )
+    withheld = tuple(
+        utxo
+        for utxo in candidates
+        if not policy.accepts(utxo)
+        and _effective_value(utxo, request.fee_rate) > 0
+    )
+    withheld_value = sum(utxo.value for utxo in withheld)
 
     def failure(
         reason: FailureReason, required: int, attempt_fee: int = fee
@@ -265,11 +333,24 @@ def _explain_failure(
             target_value=target_value,
             fee=attempt_fee,
             candidate_count=len(candidates),
+            eligible_count=len(eligible),
             spendable_count=spendable,
+            withheld_value=withheld_value,
         )
 
     if candidates and spendable == 0:
         return failure(FailureReason.DUST_ONLY, target_value + fee)
+
+    if withheld and available < target_value + fee:
+        fee_with_withheld = estimate_fee(
+            vsize + sum(_input_vsize(utxo) for utxo in withheld),
+            request.fee_rate,
+        )
+        if available + withheld_value >= target_value + fee_with_withheld:
+            return failure(
+                FailureReason.INSUFFICIENT_CONFIRMATIONS, target_value + fee
+            )
+
     if available < target_value:
         return failure(FailureReason.INSUFFICIENT_FUNDS, target_value)
     if available < target_value + fee:
@@ -287,15 +368,19 @@ def _explain_failure(
 
 
 def select_largest_first(
-    utxos: Iterable[Utxo], request: SelectionRequest
+    utxos: Iterable[Utxo],
+    request: SelectionRequest,
+    *,
+    policy: SelectionPolicy = DEFAULT_POLICY,
 ) -> Selection | SelectionFailure:
-    """Select inputs by descending value until the request is covered.
+    """Take candidates in policy order until the request is covered.
 
-    Candidates are ordered by value, then by outpoint so that equal values do
-    not make the result depend on the order they were passed in. Each further
-    input pays for itself: the fee is re-estimated over the transaction as it
-    then stands, and the search stops at the first prefix that covers the
-    targets and that fee.
+    The default policy orders them by descending value, which is where the name
+    comes from; a consolidating policy reverses that and sweeps the small
+    outputs up instead, and a confirmation requirement holds the shallow ones
+    back. Either way each further input pays for itself: the fee is
+    re-estimated over the transaction as it then stands, and the search stops
+    at the first prefix that covers the targets and that fee.
 
     Under ALLOW_CHANGE a remainder that reaches the dust threshold becomes a
     change output and anything smaller is given to the fee. FORBID_CHANGE gives
@@ -305,11 +390,13 @@ def select_largest_first(
 
     When nothing covers the request the result is a :class:`SelectionFailure`
     naming which shortfall it was, with the amounts it was measured against.
+    Outputs the policy held back are counted there rather than forgotten.
 
     Duplicate outpoints raise :exc:`ValueError`: spending one twice is a caller
     bug, not a selection that failed.
     """
-    candidates = _ordered_candidates(utxos)
+    candidates = _checked_candidates(utxos)
+    eligible = _policy_candidates(candidates, request, policy)
 
     target_value = request.total_target_value
     change_vsize = _output_vsize(request.change_script_size)
@@ -320,7 +407,7 @@ def select_largest_first(
     total_input = 0
     chosen: list[Utxo] = []
 
-    for utxo in candidates:
+    for utxo in eligible:
         chosen.append(utxo)
         total_input += utxo.value
         vsize += _input_vsize(utxo)
@@ -353,13 +440,14 @@ def select_largest_first(
             vsize=vsize,
         )
 
-    return _explain_failure(candidates, request)
+    return _explain_failure(candidates, eligible, request, policy)
 
 
 def select_branch_and_bound(
     utxos: Iterable[Utxo],
     request: SelectionRequest,
     *,
+    policy: SelectionPolicy = DEFAULT_POLICY,
     max_tries: int = _DEFAULT_MAX_TRIES,
     change_spend_script_size: int = DEFAULT_INPUT_SCRIPT_SIZE,
 ) -> Selection | SelectionFailure:
@@ -374,12 +462,14 @@ def select_branch_and_bound(
     ``change_spend_script_size`` as the unlocking size of that future input.
     Overshooting by less than that is cheaper than returning the remainder.
 
-    The search is depth-first over candidates in descending effective value,
-    visiting at most ``max_tries`` nodes and keeping the solution that
-    overshoots least. When it finds none - the usual case for a wallet whose
-    outputs do not happen to add up - :func:`select_largest_first` answers
-    instead, so the fallback is a normal selection, or the same explained
-    failure the baseline would have given.
+    The search is depth-first over the candidates the policy allows, taken in
+    descending effective value - ascending when the policy consolidates, so a
+    match is looked for among the small outputs first. It visits at most
+    ``max_tries`` nodes and keeps the solution that overshoots least. When it
+    finds none - the usual case for a wallet whose outputs do not happen to add
+    up - :func:`select_largest_first` answers instead under the same policy, so
+    the fallback is a normal selection, or the same explained failure the
+    baseline would have given.
 
     REQUIRE_CHANGE is delegated to the baseline unchanged: a policy that
     demands a change output has nothing to gain from a changeless search.
@@ -387,9 +477,11 @@ def select_branch_and_bound(
     _check_int(max_tries, "max_tries", minimum=0)
     _check_int(change_spend_script_size, "change_spend_script_size", minimum=1)
 
-    candidates = _ordered_candidates(utxos)
+    candidates = _checked_candidates(utxos)
     if request.change_policy is ChangePolicy.REQUIRE_CHANGE:
-        return select_largest_first(candidates, request)
+        return select_largest_first(candidates, request, policy=policy)
+
+    eligible = _policy_candidates(candidates, request, policy)
 
     base_vsize = _base_vsize(request)
     target_value = request.total_target_value
@@ -400,18 +492,19 @@ def select_branch_and_bound(
         _INPUT_OVERHEAD_VSIZE + change_spend_script_size, request.fee_rate
     )
 
-    pool: list[tuple[int, Utxo]] = []
-    for utxo in candidates:
-        effective = _effective_value(utxo, request.fee_rate)
-        if effective > 0:
-            pool.append((effective, utxo))
-    pool.sort(key=lambda item: (-item[0], item[1].outpoint))
+    pool = [
+        (_effective_value(utxo, request.fee_rate), utxo) for utxo in eligible
+    ]
+    if policy.consolidates_at(request.fee_rate):
+        pool.sort(key=lambda item: (item[0], item[1].outpoint))
+    else:
+        pool.sort(key=lambda item: (-item[0], item[1].outpoint))
 
     chosen = _search_changeless(
         pool, selection_target, cost_of_change, max_tries
     )
     if chosen is None:
-        return select_largest_first(candidates, request)
+        return select_largest_first(candidates, request, policy=policy)
 
     total_input = sum(utxo.value for utxo in chosen)
     vsize = base_vsize + sum(_input_vsize(utxo) for utxo in chosen)

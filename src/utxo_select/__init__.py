@@ -8,6 +8,12 @@ from utxo_select.models import (
     Target,
     Utxo,
 )
+from utxo_select.policy import (
+    DEFAULT_CONSOLIDATION_FEE_RATE,
+    DEFAULT_POLICY,
+    InputPreference,
+    SelectionPolicy,
+)
 from utxo_select.selection import (
     FailureReason,
     Selection,
@@ -24,14 +30,18 @@ from utxo_select.sizes import (
 )
 
 __all__ = [
+    "DEFAULT_CONSOLIDATION_FEE_RATE",
     "DEFAULT_INPUT_SCRIPT_SIZE",
     "DEFAULT_OUTPUT_SCRIPT_SIZE",
+    "DEFAULT_POLICY",
     "WITNESS_SCALE_FACTOR",
     "ChangePolicy",
     "FailureReason",
+    "InputPreference",
     "ScriptType",
     "Selection",
     "SelectionFailure",
+    "SelectionPolicy",
     "SelectionRequest",
     "Target",
     "Utxo",
