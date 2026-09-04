@@ -24,6 +24,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
 [project.urls]
 Homepage = "https://github.com/polycratia/utxo-select"
 Source = "https://github.com/polycratia/utxo-select"
@@ -34,3 +37,7 @@ packages = ["src/utxo_select"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

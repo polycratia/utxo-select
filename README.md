@@ -5,8 +5,9 @@ explain why a selection failed.
 
 ## Status
 
-Pre-alpha. The models, size estimation, largest-first and branch-and-bound are
-in place; the remaining strategies are not implemented yet.
+Pre-alpha. The models, size estimation, largest-first, branch-and-bound and the
+selection policies are in place; the remaining strategies are not implemented
+yet.
 
 ## Installation
 
@@ -91,11 +92,48 @@ without one — it defaults to 100000 nodes and is tunable with `max_tries` —
 the largest-first result is returned instead, so the caller always gets the
 best available answer rather than a failure.
 
+### Selection policies
+
+Two selections can pay the same targets at the same fee rate and still differ
+in what they spend: whether an output that is not yet buried deeply enough was
+used, how many of the wallet's outputs were tied together in one transaction
+for anyone reading the chain, and whether a cheap block was spent tidying up.
+That is a policy, and it is a parameter of the strategies above rather than a
+strategy of its own — it filters the candidates and fixes the order they are
+tried in, and the algorithm on top is the same one either way.
+
+```python
+from utxo_select import InputPreference, SelectionPolicy
+
+policy = SelectionPolicy(
+    min_confirmations=6,
+    input_preference=InputPreference.CONSOLIDATE_WHEN_CHEAP,
+    consolidation_fee_rate=2_000,  # per 1000 virtual bytes
+)
+
+result = select_largest_first(utxos, request, policy=policy)
+```
+
+| `input_preference` | Candidates are taken |
+| --- | --- |
+| `FEWER_INPUTS` | largest first, so the fewest outputs are linked together |
+| `MORE_INPUTS` | smallest first, sweeping small outputs into one spend |
+| `CONSOLIDATE_WHEN_CHEAP` | smallest first at or below `consolidation_fee_rate`, largest first above it |
+
+`min_confirmations` is the depth an output must have reached before it may be
+spent; the default of zero accepts anything, mempool included. Outputs held
+back are not forgotten — if the wallet would have paid with them, the failure
+comes back as `insufficient_confirmations` carrying `withheld_value`, which is
+answered by waiting rather than by funding.
+
+Both strategies take `policy=`, and `DEFAULT_POLICY` — spend anything, largest
+first — is what a caller gets without asking for one.
+
 ### When a selection fails
 
-A failure is a returned value, not an exception, and it names which of four
-things went wrong. They are worth telling apart: two of them are answered by
-funding the wallet, and two by changing the request.
+A failure is a returned value, not an exception, and it names which of five
+things went wrong. They are worth telling apart: some are answered by funding
+the wallet, one only by waiting, and the rest by changing the request.
 
 | `reason` | What happened |
 | --- | --- |
@@ -103,11 +141,12 @@ funding the wallet, and two by changing the request.
 | `insufficient_after_fees` | they hold the targets but not the fee on top |
 | `dust_only` | every candidate costs more to spend than it holds |
 | `change_below_dust` | they can pay, but leave no change worth relaying |
+| `insufficient_confirmations` | they hold enough, but not deeply enough confirmed |
 
 The numbers behind the verdict come with it: `available` against `required`
 and the `shortfall` between them, the `fee` a transaction spending every
-candidate would owe, the `target_value` asked for, and how many candidates
-were worth spending at all.
+candidate would owe, the `target_value` asked for, how many candidates were
+worth spending at all, and how many the policy held back.
 
 ```python
 from utxo_select import FailureReason, SelectionFailure
@@ -119,6 +158,8 @@ if isinstance(result, SelectionFailure):
     print(result.spendable_count, "of", result.candidate_count, "spendable")
     if result.reason is FailureReason.INSUFFICIENT_AFTER_FEES:
         print("a lower fee rate closes a gap of", result.shortfall)
+    if result.reason is FailureReason.INSUFFICIENT_CONFIRMATIONS:
+        print(result.withheld_value, "waits on", result.withheld_count, "outputs")
 ```
 
 ### Size and fee estimation
@@ -145,7 +186,8 @@ print(ScriptType.P2PKH.input_vsize)  # marginal cost of one more legacy input
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
+python -m pytest
 ```
 
 ## License
