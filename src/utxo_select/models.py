@@ -3,12 +3,22 @@
 Every amount and size in this module is an integer of base units (satoshis for
 Bitcoin-like chains). Floats are rejected at construction time so that rounding
 error can never reach a transaction.
+
+An output can say what it costs in one of two ways. ``script_type`` names the
+script kind, and a selection then prices it by weight, so the witness discount
+and the marker and flag a segwit transaction carries reach the fee.
+``script_size`` is the older hint: a size in virtual bytes, read as a legacy
+shape of that size. The hint is what a caller gets without asking, and on a
+legacy transaction the two paths bill the same.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+
+from utxo_select._validate import _check_int
+from utxo_select.sizes import ScriptType
 
 __all__ = [
     "DEFAULT_INPUT_SCRIPT_SIZE",
@@ -26,13 +36,11 @@ DEFAULT_INPUT_SCRIPT_SIZE = 107
 DEFAULT_OUTPUT_SCRIPT_SIZE = 25
 
 
-def _check_int(value: object, name: str, *, minimum: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
+def _check_script_type(value: object, name: str) -> None:
+    if value is not None and not isinstance(value, ScriptType):
         raise TypeError(
-            f"{name} must be an int of base units, got {type(value).__name__}"
+            f"{name} must be a ScriptType or None, got {type(value).__name__}"
         )
-    if value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {value}")
 
 
 class ChangePolicy(Enum):
@@ -53,8 +61,10 @@ class ChangePolicy(Enum):
 class Utxo:
     """A spendable output.
 
-    ``script_size`` is a hint: the virtual size of the unlocking data this
-    input will carry, used to estimate the fee the input costs to spend.
+    ``script_type`` is the script kind this output is locked to; when it is
+    given, the input spending it is priced by weight and ``script_size`` is not
+    read. ``script_size`` is the hint used otherwise: the virtual size of the
+    unlocking data the input will carry.
     """
 
     txid: str
@@ -62,6 +72,7 @@ class Utxo:
     value: int
     confirmations: int = 0
     script_size: int = DEFAULT_INPUT_SCRIPT_SIZE
+    script_type: ScriptType | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.txid, str) or not self.txid:
@@ -70,6 +81,7 @@ class Utxo:
         _check_int(self.value, "value", minimum=1)
         _check_int(self.confirmations, "confirmations", minimum=0)
         _check_int(self.script_size, "script_size", minimum=1)
+        _check_script_type(self.script_type, "script_type")
 
     @property
     def outpoint(self) -> str:
@@ -82,14 +94,20 @@ class Utxo:
 
 @dataclass(frozen=True, slots=True)
 class Target:
-    """An amount that must be paid, and the size of the output paying it."""
+    """An amount that must be paid, and the shape of the output paying it.
+
+    ``script_type`` prices the output by weight when it is given; otherwise the
+    ``script_size`` hint is read as the locking script of a legacy output.
+    """
 
     value: int
     script_size: int = DEFAULT_OUTPUT_SCRIPT_SIZE
+    script_type: ScriptType | None = None
 
     def __post_init__(self) -> None:
         _check_int(self.value, "value", minimum=1)
         _check_int(self.script_size, "script_size", minimum=1)
+        _check_script_type(self.script_type, "script_type")
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +116,9 @@ class SelectionRequest:
 
     ``fee_rate`` is given per 1000 virtual bytes so that rates finer than one
     unit per vbyte stay expressible without leaving integer arithmetic.
+    ``change_script_type`` describes the change output the way a target
+    describes its own, and when it is given it also fixes what spending that
+    change output later will cost.
     """
 
     targets: tuple[Target, ...]
@@ -105,6 +126,7 @@ class SelectionRequest:
     dust_threshold: int = 546
     change_policy: ChangePolicy = ChangePolicy.ALLOW_CHANGE
     change_script_size: int = DEFAULT_OUTPUT_SCRIPT_SIZE
+    change_script_type: ScriptType | None = None
 
     def __post_init__(self) -> None:
         targets = tuple(self.targets)
@@ -121,6 +143,7 @@ class SelectionRequest:
         _check_int(self.fee_rate, "fee_rate", minimum=0)
         _check_int(self.dust_threshold, "dust_threshold", minimum=0)
         _check_int(self.change_script_size, "change_script_size", minimum=1)
+        _check_script_type(self.change_script_type, "change_script_type")
         if not isinstance(self.change_policy, ChangePolicy):
             raise TypeError(
                 f"change_policy must be a ChangePolicy, got "

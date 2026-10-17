@@ -18,11 +18,15 @@ wallet would rather link few of its outputs in one transaction or use a cheap
 block to sweep many. The policy filters the candidates and decides the order
 they are tried in; neither strategy branches on it.
 
-Sizes here come from the ``script_size`` hints carried by the models rather
-than from :class:`~utxo_select.sizes.ScriptType`: a transaction costs a fixed
+Sizes come from the models by one of two paths. When an output or a target
+names a :class:`~utxo_select.sizes.ScriptType`, it is priced by weight through
+:func:`~utxo_select.sizes.estimate_weight` and the whole transaction is
+rounded to virtual bytes once at the end, so the witness discount and the
+marker and flag of a segwit transaction reach the fee. When it carries only a
+``script_size`` hint, the hint is read as a legacy shape of that size: a fixed
 overhead, plus 41 virtual bytes and the unlocking script for every input, plus
-9 virtual bytes and the locking script for every output. Script sizes are read
-as virtual bytes, so a hint for a witness script should already be discounted.
+9 vbytes and the locking script for every output. The paths mix freely within
+one transaction, and on legacy shapes they bill the same to the base unit.
 
 A selection either covers the targets and the fee in full, or it comes back as
 a :class:`SelectionFailure`. The identity inputs == targets + change + fee is
@@ -49,7 +53,12 @@ from utxo_select.models import (
     _check_int,
 )
 from utxo_select.policy import DEFAULT_POLICY, SelectionPolicy
-from utxo_select.sizes import estimate_fee
+from utxo_select.sizes import (
+    WITNESS_SCALE_FACTOR,
+    ScriptType,
+    estimate_fee,
+    estimate_weight,
+)
 
 __all__ = [
     "FailureReason",
@@ -59,14 +68,16 @@ __all__ = [
     "select_largest_first",
 ]
 
-# version 4 + locktime 4 + a one-byte varint for each of the two counts.
-_TX_OVERHEAD_VSIZE = 10
-
 # outpoint 36 + sequence 4 + a one-byte varint for the unlocking script.
 _INPUT_OVERHEAD_VSIZE = 41
 
 # amount 8 + a one-byte varint for the locking script.
 _OUTPUT_OVERHEAD_VSIZE = 9
+
+# A size hint describes a legacy shape - no witness data - so it is priced as
+# a P2PKH input or output stretched to the hinted size. At the default hints
+# the stretch is zero, which is what makes both paths agree there.
+_HINT_TYPE = ScriptType.P2PKH
 
 # Nodes the branch-and-bound search may visit before it gives up.
 _DEFAULT_MAX_TRIES = 100_000
@@ -235,18 +246,83 @@ class SelectionFailure:
         )
 
 
+def _weight_to_vsize(weight: int) -> int:
+    return -(-weight // WITNESS_SCALE_FACTOR)
+
+
+def _hint_input_weight(script_size: int) -> int:
+    return (_INPUT_OVERHEAD_VSIZE + script_size) * WITNESS_SCALE_FACTOR
+
+
+def _hint_output_weight(script_size: int) -> int:
+    return (_OUTPUT_OVERHEAD_VSIZE + script_size) * WITNESS_SCALE_FACTOR
+
+
+def _input_shape(utxo: Utxo) -> tuple[ScriptType, int]:
+    """The script type an input is priced as, and the weight it adds to that.
+
+    Giving the hint path a script type too is what lets both paths go through
+    :func:`~utxo_select.sizes.estimate_weight` together: the hinted bytes ride
+    along as scaled weight, while the function still decides on its own
+    whether the transaction carries a witness at all.
+    """
+    if utxo.script_type is not None:
+        return utxo.script_type, 0
+    extra = _hint_input_weight(utxo.script_size) - _HINT_TYPE.input_weight
+    return _HINT_TYPE, extra
+
+
+def _output_shape(
+    script_type: ScriptType | None, script_size: int
+) -> tuple[ScriptType, int]:
+    if script_type is not None:
+        return script_type, 0
+    extra = _hint_output_weight(script_size) - _HINT_TYPE.output_weight
+    return _HINT_TYPE, extra
+
+
 def _input_vsize(utxo: Utxo) -> int:
-    return _INPUT_OVERHEAD_VSIZE + utxo.script_size
+    """Marginal cost of one more input, rounded on its own."""
+    script_type, extra = _input_shape(utxo)
+    return _weight_to_vsize(script_type.input_weight + extra)
 
 
-def _output_vsize(script_size: int) -> int:
-    return _OUTPUT_OVERHEAD_VSIZE + script_size
+def _output_vsize(script_type: ScriptType | None, script_size: int) -> int:
+    shape, extra = _output_shape(script_type, script_size)
+    return _weight_to_vsize(shape.output_weight + extra)
 
 
-def _base_vsize(request: SelectionRequest) -> int:
-    return _TX_OVERHEAD_VSIZE + sum(
-        _output_vsize(target.script_size) for target in request.targets
-    )
+def _tx_vsize(
+    inputs: Sequence[Utxo], request: SelectionRequest, *, with_change: bool
+) -> int:
+    """Virtual size of the transaction these inputs and the request form.
+
+    The weight of every part is added up first and divided once, so a witness
+    input is not charged for the three quarters of a byte that rounding it on
+    its own would add.
+    """
+    input_types: list[ScriptType] = []
+    output_types: list[ScriptType] = []
+    extra = 0
+
+    for utxo in inputs:
+        script_type, more = _input_shape(utxo)
+        input_types.append(script_type)
+        extra += more
+
+    outputs = [
+        (target.script_type, target.script_size) for target in request.targets
+    ]
+    if with_change:
+        outputs.append(
+            (request.change_script_type, request.change_script_size)
+        )
+    for script_type, script_size in outputs:
+        shape, more = _output_shape(script_type, script_size)
+        output_types.append(shape)
+        extra += more
+
+    return _weight_to_vsize(estimate_weight(input_types, output_types) + extra)
 
 
 def _effective_value(utxo: Utxo, fee_rate: int) -> int:
@@ -308,7 +384,7 @@ def _explain_failure(
     """
     target_value = request.total_target_value
     available = sum(utxo.value for utxo in eligible)
-    vsize = _base_vsize(request) + sum(_input_vsize(utxo) for utxo in eligible)
+    vsize = _tx_vsize(eligible, request, with_change=False)
     fee = estimate_fee(vsize, request.fee_rate)
     spendable = sum(
         1
@@ -343,7 +419,9 @@ def _explain_failure(
 
     if withheld and available < target_value + fee:
         fee_with_withheld = estimate_fee(
-            vsize + sum(_input_vsize(utxo) for utxo in withheld),
+            _tx_vsize(
+                (*eligible, *withheld), request, with_change=False
+            ),
             request.fee_rate,
         )
         if available + withheld_value >= target_value + fee_with_withheld:
@@ -357,7 +435,7 @@ def _explain_failure(
         return failure(FailureReason.INSUFFICIENT_AFTER_FEES, target_value + fee)
 
     fee_with_change = estimate_fee(
-        vsize + _output_vsize(request.change_script_size), request.fee_rate
+        _tx_vsize(eligible, request, with_change=True), request.fee_rate
     )
     minimum_change = max(request.dust_threshold, 1)
     return failure(
@@ -379,8 +457,9 @@ def select_largest_first(
     comes from; a consolidating policy reverses that and sweeps the small
     outputs up instead, and a confirmation requirement holds the shallow ones
     back. Either way each further input pays for itself: the fee is
-    re-estimated over the transaction as it then stands, and the search stops
-    at the first prefix that covers the targets and that fee.
+    re-estimated over the transaction as it then stands, priced by weight and
+    rounded once, and the search stops at the first prefix that covers the
+    targets and that fee.
 
     Under ALLOW_CHANGE a remainder that reaches the dust threshold becomes a
     change output and anything smaller is given to the fee. FORBID_CHANGE gives
@@ -399,26 +478,25 @@ def select_largest_first(
     eligible = _policy_candidates(candidates, request, policy)
 
     target_value = request.total_target_value
-    change_vsize = _output_vsize(request.change_script_size)
     minimum_change = max(request.dust_threshold, 1)
     wants_change = request.change_policy is not ChangePolicy.FORBID_CHANGE
 
-    vsize = _base_vsize(request)
     total_input = 0
     chosen: list[Utxo] = []
 
     for utxo in eligible:
         chosen.append(utxo)
         total_input += utxo.value
-        vsize += _input_vsize(utxo)
 
+        vsize = _tx_vsize(chosen, request, with_change=False)
         fee = estimate_fee(vsize, request.fee_rate)
         if total_input - target_value - fee < 0:
             continue
 
         if wants_change:
+            vsize_with_change = _tx_vsize(chosen, request, with_change=True)
             fee_with_change = estimate_fee(
-                vsize + change_vsize, request.fee_rate
+                vsize_with_change, request.fee_rate
             )
             change = total_input - target_value - fee_with_change
             if change >= minimum_change:
@@ -427,7 +505,7 @@ def select_largest_first(
                     targets=request.targets,
                     change=change,
                     fee=fee_with_change,
-                    vsize=vsize + change_vsize,
+                    vsize=vsize_with_change,
                 )
             if request.change_policy is ChangePolicy.REQUIRE_CHANGE:
                 continue
@@ -458,8 +536,10 @@ def select_branch_and_bound(
     to spend than it holds is never considered. A subset is a solution when its
     effective value covers the targets and the fee of a transaction without a
     change output, and overshoots by no more than the cost of change: the fee
-    of the change output now plus the fee of spending it later, estimated with
-    ``change_spend_script_size`` as the unlocking size of that future input.
+    of the change output now plus the fee of spending it later. That future
+    input is priced by ``change_script_type`` when the request names one, since
+    the change output's own kind is what will be spent, and by
+    ``change_spend_script_size`` when it does not.
     Overshooting by less than that is cheaper than returning the remainder.
 
     The search is depth-first over the candidates the policy allows, taken in
@@ -483,14 +563,22 @@ def select_branch_and_bound(
 
     eligible = _policy_candidates(candidates, request, policy)
 
-    base_vsize = _base_vsize(request)
+    base_vsize = _tx_vsize((), request, with_change=False)
     target_value = request.total_target_value
     selection_target = target_value + estimate_fee(base_vsize, request.fee_rate)
+
+    if request.change_script_type is not None:
+        change_spend_vsize = _weight_to_vsize(
+            request.change_script_type.input_weight
+        )
+    else:
+        change_spend_vsize = _weight_to_vsize(
+            _hint_input_weight(change_spend_script_size)
+        )
     cost_of_change = estimate_fee(
-        _output_vsize(request.change_script_size), request.fee_rate
-    ) + estimate_fee(
-        _INPUT_OVERHEAD_VSIZE + change_spend_script_size, request.fee_rate
-    )
+        _output_vsize(request.change_script_type, request.change_script_size),
+        request.fee_rate,
+    ) + estimate_fee(change_spend_vsize, request.fee_rate)
 
     pool = [
         (_effective_value(utxo, request.fee_rate), utxo) for utxo in eligible
@@ -507,12 +595,19 @@ def select_branch_and_bound(
         return select_largest_first(candidates, request, policy=policy)
 
     total_input = sum(utxo.value for utxo in chosen)
-    vsize = base_vsize + sum(_input_vsize(utxo) for utxo in chosen)
+    vsize = _tx_vsize(chosen, request, with_change=False)
+    fee = total_input - target_value
+    # The search prices each input on its own, which can miss the marker and
+    # flag of the transaction they end up in; a subset that no longer pays for
+    # the size it would occupy is not a solution after all.
+    if fee < estimate_fee(vsize, request.fee_rate):
+        return select_largest_first(candidates, request, policy=policy)
+
     return Selection(
         inputs=chosen,
         targets=request.targets,
         change=0,
-        fee=total_input - target_value,
+        fee=fee,
         vsize=vsize,
     )
 

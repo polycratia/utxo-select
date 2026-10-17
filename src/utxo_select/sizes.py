@@ -8,7 +8,8 @@ virtual size is rounded up, never down.
 
 Weight units (BIP 141) are the primitive: witness bytes count once, every other
 byte counts four times, and virtual size is the weight divided by four. Working
-in weight keeps the arithmetic integral until that last division.
+in weight keeps the arithmetic integral until that last division, which is why
+the selection strategies price a whole transaction here and round it once.
 
 The input and output counts are assumed to fit in a single-byte varint, which
 holds up to 252 of each.
@@ -19,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from enum import Enum
 
-from utxo_select.models import _check_int
+from utxo_select._validate import _check_int
 
 __all__ = [
     "WITNESS_SCALE_FACTOR",
