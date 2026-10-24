@@ -41,6 +41,47 @@ than that and gives the remainder to the fee has spent less than one that
 returns it politely. That figure is the cost of change, and it is exactly the
 tolerance branch-and-bound searches within.
 
+### Priced by weight, or by a size hint
+
+The figures above describe a legacy transaction, which is what these models
+describe by default: `script_size` is a size in virtual bytes, read as a legacy
+input or output stretched to it.
+
+`script_type` says what the script actually is, and a selection then prices
+that input or output in weight units and divides the whole transaction by four
+once, at the end. Three things reach the fee that a size hint cannot express:
+the witness discount, the marker and flag a segwit transaction carries once,
+and the empty witness stack a legacy input carries alongside segwit ones.
+
+```python
+from utxo_select import ScriptType
+
+wallet = [
+    Utxo(
+        txid="a" * 64,
+        vout=0,
+        value=200_000,
+        confirmations=12,
+        script_type=ScriptType.P2WPKH,
+    ),
+]
+
+request = SelectionRequest(
+    targets=(Target(value=100_000, script_type=ScriptType.P2WPKH),),
+    fee_rate=12_000,
+    dust_threshold=546,
+    change_script_type=ScriptType.P2WPKH,
+)
+```
+
+That spend is 141 vbytes and 1_692 in fees, against the 226 vbytes and 2_712
+of the same selection in legacy shapes — one input, one target, one change
+output either way.
+
+The two paths mix freely inside one transaction, and on a legacy shape they
+agree to the base unit: a default `Utxo` and the same output declared as
+`script_type=ScriptType.P2PKH` are billed identically.
+
 ### Three selections on the same wallet
 
 ```python
@@ -296,6 +337,10 @@ vsize = estimate_vsize(
 print(vsize, estimate_fee(vsize, fee_rate=12_000))
 print(ScriptType.P2PKH.input_vsize)  # marginal cost of one more legacy input
 ```
+
+`Utxo`, `Target` and `SelectionRequest.change_script_type` take the same
+`ScriptType`, and a selection given them prices itself through
+`estimate_weight` rather than through the size hints.
 
 ## Development
 
