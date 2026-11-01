@@ -11,6 +11,14 @@ byte counts four times, and virtual size is the weight divided by four. Working
 in weight keeps the arithmetic integral until that last division, which is why
 the selection strategies price a whole transaction here and round it once.
 
+A part of a transaction says what it costs in one of two ways. A
+:class:`ScriptType` names the script kind, which fixes the whole weight of an
+input or an output of it, witness data included. A size hint is a size in
+virtual bytes - the unlocking or locking script on its own - and is read as a
+legacy shape of that size: no witness data, so all of it scaled. The two meet
+in :func:`estimate_shaped_weight`, which is what lets one transaction mix them
+and still be rounded once.
+
 The input and output counts are assumed to fit in a single-byte varint, which
 holds up to 252 of each.
 """
@@ -23,11 +31,17 @@ from enum import Enum
 from utxo_select._validate import _check_int
 
 __all__ = [
+    "INPUT_OVERHEAD_VSIZE",
+    "OUTPUT_OVERHEAD_VSIZE",
     "WITNESS_SCALE_FACTOR",
     "ScriptType",
     "estimate_fee",
+    "estimate_shaped_weight",
     "estimate_vsize",
     "estimate_weight",
+    "input_weight",
+    "output_weight",
+    "weight_to_vsize",
 ]
 
 WITNESS_SCALE_FACTOR = 4
@@ -43,6 +57,12 @@ _MARKER_WEIGHT = 2
 
 # The empty witness stack a legacy input still carries in a segwit transaction.
 _EMPTY_WITNESS_WEIGHT = 1
+
+# outpoint 36 + sequence 4 + a one-byte varint for the unlocking script.
+INPUT_OVERHEAD_VSIZE = 41
+
+# amount 8 + a one-byte varint for the locking script.
+OUTPUT_OVERHEAD_VSIZE = 9
 
 
 class ScriptType(Enum):
@@ -80,12 +100,12 @@ class ScriptType(Enum):
         this is a safe marginal cost to compare candidates with, not a term to
         sum into a total. Use :func:`estimate_vsize` for the total.
         """
-        return _weight_to_vsize(self.input_weight)
+        return weight_to_vsize(self.input_weight)
 
     @property
     def output_vsize(self) -> int:
         """Virtual size of one output of this type."""
-        return _weight_to_vsize(self.output_weight)
+        return weight_to_vsize(self.output_weight)
 
 
 # Non-witness part of an input is outpoint 36 + scriptSig with its length
@@ -108,7 +128,8 @@ _OUTPUT_WEIGHT: dict[ScriptType, int] = {
 }
 
 
-def _weight_to_vsize(weight: int) -> int:
+def weight_to_vsize(weight: int) -> int:
+    """Virtual size of a weight, rounded up as consensus and relay policy do."""
     return -(-weight // WITNESS_SCALE_FACTOR)
 
 
@@ -125,6 +146,59 @@ def _as_script_types(
     return items
 
 
+def input_weight(script_type: ScriptType | None, script_size: int) -> int:
+    """Weight one input adds, from its script type or from its size hint.
+
+    The hint is read only when no script type is given, and then as the
+    unlocking script of a legacy input stretched to it.
+    """
+    if script_type is not None:
+        return script_type.input_weight
+    return (INPUT_OVERHEAD_VSIZE + script_size) * WITNESS_SCALE_FACTOR
+
+
+def output_weight(script_type: ScriptType | None, script_size: int) -> int:
+    """Weight one output adds, from its script type or from its size hint."""
+    if script_type is not None:
+        return script_type.output_weight
+    return (OUTPUT_OVERHEAD_VSIZE + script_size) * WITNESS_SCALE_FACTOR
+
+
+def estimate_shaped_weight(
+    inputs: Iterable[tuple[ScriptType | None, int]],
+    outputs: Iterable[tuple[ScriptType | None, int]],
+) -> int:
+    """Weight of a transaction whose parts are described either way.
+
+    Every entry is a script type, or ``None`` and the size hint to be read
+    instead. A part described by a hint is a legacy shape: it carries no
+    witness data of its own, and still pays for the empty witness stack that a
+    transaction with any witness input gives it.
+
+    Both sequences may be empty, so a partially built transaction can be
+    measured while its inputs are still being chosen; the fixed overhead is
+    always counted.
+    """
+    weight = _OVERHEAD_WEIGHT
+    witness = False
+    legacy = 0
+
+    for script_type, script_size in inputs:
+        weight += input_weight(script_type, script_size)
+        if script_type is not None and script_type.is_segwit:
+            witness = True
+        else:
+            legacy += 1
+
+    for script_type, script_size in outputs:
+        weight += output_weight(script_type, script_size)
+
+    if witness:
+        weight += _MARKER_WEIGHT + legacy * _EMPTY_WITNESS_WEIGHT
+
+    return weight
+
+
 def estimate_weight(
     inputs: Iterable[ScriptType], outputs: Iterable[ScriptType]
 ) -> int:
@@ -138,23 +212,18 @@ def estimate_weight(
     spent = _as_script_types(inputs, "inputs")
     created = _as_script_types(outputs, "outputs")
 
-    weight = _OVERHEAD_WEIGHT
-    weight += sum(script_type.input_weight for script_type in spent)
-    weight += sum(script_type.output_weight for script_type in created)
-
-    if any(script_type.is_segwit for script_type in spent):
-        weight += _MARKER_WEIGHT
-        legacy = sum(1 for script_type in spent if not script_type.is_segwit)
-        weight += legacy * _EMPTY_WITNESS_WEIGHT
-
-    return weight
+    # Every part names its type, so the size hint beside it is never read.
+    return estimate_shaped_weight(
+        ((script_type, 0) for script_type in spent),
+        ((script_type, 0) for script_type in created),
+    )
 
 
 def estimate_vsize(
     inputs: Iterable[ScriptType], outputs: Iterable[ScriptType]
 ) -> int:
     """Virtual size in vbytes, rounded up as consensus and relay policy do."""
-    return _weight_to_vsize(estimate_weight(inputs, outputs))
+    return weight_to_vsize(estimate_weight(inputs, outputs))
 
 
 def estimate_fee(vsize: int, fee_rate: int) -> int:

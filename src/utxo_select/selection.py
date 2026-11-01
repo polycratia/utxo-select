@@ -18,15 +18,16 @@ wallet would rather link few of its outputs in one transaction or use a cheap
 block to sweep many. The policy filters the candidates and decides the order
 they are tried in; neither strategy branches on it.
 
-Sizes come from the models by one of two paths. When an output or a target
-names a :class:`~utxo_select.sizes.ScriptType`, it is priced by weight through
-:func:`~utxo_select.sizes.estimate_weight` and the whole transaction is
-rounded to virtual bytes once at the end, so the witness discount and the
-marker and flag of a segwit transaction reach the fee. When it carries only a
-``script_size`` hint, the hint is read as a legacy shape of that size: a fixed
-overhead, plus 41 virtual bytes and the unlocking script for every input, plus
-9 vbytes and the locking script for every output. The paths mix freely within
-one transaction, and on legacy shapes they bill the same to the base unit.
+Sizes come from the models by one of two paths, and both end in
+:func:`~utxo_select.sizes.estimate_shaped_weight`: the whole transaction is
+measured in weight units and rounded to virtual bytes once at the end, so the
+witness discount and the marker and flag of a segwit transaction reach the fee.
+An output or a target naming a :class:`~utxo_select.sizes.ScriptType` is priced
+by that type. One carrying only a ``script_size`` hint is read as a legacy
+shape of that size: a fixed overhead, plus 41 virtual bytes and the unlocking
+script for every input, plus 9 vbytes and the locking script for every output.
+The paths mix freely within one transaction, and on legacy shapes they bill the
+same to the base unit.
 
 A selection either covers the targets and the fee in full, or it comes back as
 a :class:`SelectionFailure`. The identity inputs == targets + change + fee is
@@ -54,10 +55,12 @@ from utxo_select.models import (
 )
 from utxo_select.policy import DEFAULT_POLICY, SelectionPolicy
 from utxo_select.sizes import (
-    WITNESS_SCALE_FACTOR,
     ScriptType,
     estimate_fee,
-    estimate_weight,
+    estimate_shaped_weight,
+    input_weight,
+    output_weight,
+    weight_to_vsize,
 )
 
 __all__ = [
@@ -67,17 +70,6 @@ __all__ = [
     "select_branch_and_bound",
     "select_largest_first",
 ]
-
-# outpoint 36 + sequence 4 + a one-byte varint for the unlocking script.
-_INPUT_OVERHEAD_VSIZE = 41
-
-# amount 8 + a one-byte varint for the locking script.
-_OUTPUT_OVERHEAD_VSIZE = 9
-
-# A size hint describes a legacy shape - no witness data - so it is priced as
-# a P2PKH input or output stretched to the hinted size. At the default hints
-# the stretch is zero, which is what makes both paths agree there.
-_HINT_TYPE = ScriptType.P2PKH
 
 # Nodes the branch-and-bound search may visit before it gives up.
 _DEFAULT_MAX_TRIES = 100_000
@@ -246,50 +238,13 @@ class SelectionFailure:
         )
 
 
-def _weight_to_vsize(weight: int) -> int:
-    return -(-weight // WITNESS_SCALE_FACTOR)
-
-
-def _hint_input_weight(script_size: int) -> int:
-    return (_INPUT_OVERHEAD_VSIZE + script_size) * WITNESS_SCALE_FACTOR
-
-
-def _hint_output_weight(script_size: int) -> int:
-    return (_OUTPUT_OVERHEAD_VSIZE + script_size) * WITNESS_SCALE_FACTOR
-
-
-def _input_shape(utxo: Utxo) -> tuple[ScriptType, int]:
-    """The script type an input is priced as, and the weight it adds to that.
-
-    Giving the hint path a script type too is what lets both paths go through
-    :func:`~utxo_select.sizes.estimate_weight` together: the hinted bytes ride
-    along as scaled weight, while the function still decides on its own
-    whether the transaction carries a witness at all.
-    """
-    if utxo.script_type is not None:
-        return utxo.script_type, 0
-    extra = _hint_input_weight(utxo.script_size) - _HINT_TYPE.input_weight
-    return _HINT_TYPE, extra
-
-
-def _output_shape(
-    script_type: ScriptType | None, script_size: int
-) -> tuple[ScriptType, int]:
-    if script_type is not None:
-        return script_type, 0
-    extra = _hint_output_weight(script_size) - _HINT_TYPE.output_weight
-    return _HINT_TYPE, extra
-
-
 def _input_vsize(utxo: Utxo) -> int:
     """Marginal cost of one more input, rounded on its own."""
-    script_type, extra = _input_shape(utxo)
-    return _weight_to_vsize(script_type.input_weight + extra)
+    return weight_to_vsize(input_weight(utxo.script_type, utxo.script_size))
 
 
 def _output_vsize(script_type: ScriptType | None, script_size: int) -> int:
-    shape, extra = _output_shape(script_type, script_size)
-    return _weight_to_vsize(shape.output_weight + extra)
+    return weight_to_vsize(output_weight(script_type, script_size))
 
 
 def _tx_vsize(
@@ -301,15 +256,6 @@ def _tx_vsize(
     input is not charged for the three quarters of a byte that rounding it on
     its own would add.
     """
-    input_types: list[ScriptType] = []
-    output_types: list[ScriptType] = []
-    extra = 0
-
-    for utxo in inputs:
-        script_type, more = _input_shape(utxo)
-        input_types.append(script_type)
-        extra += more
-
     outputs = [
         (target.script_type, target.script_size) for target in request.targets
     ]
@@ -317,12 +263,11 @@ def _tx_vsize(
         outputs.append(
             (request.change_script_type, request.change_script_size)
         )
-    for script_type, script_size in outputs:
-        shape, more = _output_shape(script_type, script_size)
-        output_types.append(shape)
-        extra += more
-
-    return _weight_to_vsize(estimate_weight(input_types, output_types) + extra)
+    return weight_to_vsize(
+        estimate_shaped_weight(
+            [(utxo.script_type, utxo.script_size) for utxo in inputs], outputs
+        )
+    )
 
 
 def _effective_value(utxo: Utxo, fee_rate: int) -> int:
@@ -567,14 +512,9 @@ def select_branch_and_bound(
     target_value = request.total_target_value
     selection_target = target_value + estimate_fee(base_vsize, request.fee_rate)
 
-    if request.change_script_type is not None:
-        change_spend_vsize = _weight_to_vsize(
-            request.change_script_type.input_weight
-        )
-    else:
-        change_spend_vsize = _weight_to_vsize(
-            _hint_input_weight(change_spend_script_size)
-        )
+    change_spend_vsize = weight_to_vsize(
+        input_weight(request.change_script_type, change_spend_script_size)
+    )
     cost_of_change = estimate_fee(
         _output_vsize(request.change_script_type, request.change_script_size),
         request.fee_rate,
